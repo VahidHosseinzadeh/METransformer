@@ -4,11 +4,14 @@
 # PyTorch module plus wandb and pytest):
 #
 #   sbatch --job-name=met_ms1 submit_bridges2.sbatch met 1
-#   SMOKE=1 RUN_TESTS=1 sbatch --job-name=met_smoke --time=00:30:00 submit_bridges2.sbatch met 1
+#   sbatch --export=ALL,SMOKE=1,RUN_TESTS=1 --job-name=met_smoke --time=00:30:00 \
+#       submit_bridges2.sbatch met 1
 #   sbatch --gres=gpu:h100-80:1 --time=08:00:00 --job-name=met_ms1 submit_bridges2.sbatch met 1
 #
 # V100-32 by default: one run takes 565 ms per step there, about 15 h for 50 epochs at 1 SU per
 # GPU-hour, and keeps the GPU busy. An H100 hour costs 2 SU.
+# Bridges-2 sets SBATCH_EXPORT=NONE, so variables such as SMOKE, RUN_TESTS, NUM_WORKERS and
+# EXTRA_ARGS reach the job only through --export=ALL,NAME=value.
 # Runs write to runs/ in the repo, under $HOME: the project's /ocean space is shared by the
 # whole allocation and was full on 2026-10-31. The job exits with Python's exit code, and a
 # rerun with the same arguments resumes from the save dir's checkpoint.

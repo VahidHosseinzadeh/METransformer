@@ -118,10 +118,11 @@ The dataset code is MELSTM's, copied unchanged
 git clone https://github.com/VahidHosseinzadeh/METransformer.git && cd METransformer
 bash scripts/setup_bridges2.sh   # PSC's PyTorch module + a thin .venv with wandb and pytest
 # data/MNIST/raw: the four MNIST files (login nodes refuse scp; a tar over ssh works)
-SMOKE=1 RUN_TESTS=1 sbatch --job-name=met_smoke --time=00:30:00 submit_bridges2.sbatch met 1
-sbatch --job-name=met_ms1 submit_bridges2.sbatch met 1      # H100; --gres=gpu:v100-32:1 for a V100
+sbatch --export=ALL,SMOKE=1,RUN_TESTS=1 --job-name=met_smoke --time=00:30:00 submit_bridges2.sbatch met 1
+sbatch --job-name=met_ms1 submit_bridges2.sbatch met 1      # V100-32; --gres=gpu:h100-80:1 for an H100
 ```
 
 The PyTorch stack is PSC's module (`pytorch/26.05-2.11-py3`: torch 2.11, cuDNN 9.10); the
 setup adds only wandb and pytest. Runs write under the repo in `$HOME`, because the
-allocation's shared `/ocean` space was full. An H100 hour costs 2 SU, a V100 or L40S hour 1 SU.
+allocation's shared `/ocean` space was full. Bridges-2 sets `SBATCH_EXPORT=NONE`: environment
+variables reach a job only through `--export=ALL,NAME=value`. An H100 hour costs 2 SU, a V100 or L40S hour 1 SU.
