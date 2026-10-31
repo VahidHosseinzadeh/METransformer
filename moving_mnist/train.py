@@ -29,6 +29,8 @@ from metransformer.lift import make_lift
 from metransformer.model import METransformer
 from moving_mnist.data import LEN_GEN_SEED, TEST_SEED, fixed_set, make_dataset
 from moving_mnist.velocity_metrics import summarize, velocity_matches
+from moving_mnist.visualize import (boundary_age, lag_bias_figure, plt, rollout_figure,
+                                    slot_states, state_figure, velocity_figure)
 
 
 def parse_args(argv=None):
@@ -94,10 +96,11 @@ def parse_args(argv=None):
     g.add_argument("--save_dir", required=True)
     g.add_argument("--wandb_project", default="METransformer")
     g.add_argument("--wandb_name", default=None)
+    g.add_argument("--wandb_group", default=None, help="e.g. the arm, to group its seeds")
     g.add_argument("--wandb_mode", choices=["online", "offline", "disabled"], default="online")
     g.add_argument("--log_every", type=int, default=25, help="batches between train-curve points")
     g.add_argument("--val_probe_size", type=int, default=256)
-    g.add_argument("--val_probe_every", type=int, default=25, help="batches; 0 = off")
+    g.add_argument("--val_probe_every", type=int, default=50, help="batches; 0 = off")
     g.add_argument("--image_every", type=int, default=5, help="epochs between prediction strips")
     args = p.parse_args(argv)
     if args.input_frames >= args.seq_len:
@@ -166,10 +169,12 @@ def frame_errors(pred, target):
 
 
 @torch.no_grad()
-def evaluate(runner, batches, pred_len, with_velocity):
-    """batches: iterable of (seq, motion) on the CPU -> dict of per-sequence arrays."""
+def evaluate(runner, batches, pred_len, with_velocity, keep=0):
+    """batches: iterable of (seq, motion) on the CPU -> dict of per-sequence arrays: MSE and L1
+    per frame, the boundary age of each digit, the velocity matches; with keep, also the
+    frames, motions and predictions of the first `keep` sequences."""
     runner.model.eval()
-    mse, l1, matches = [], [], []
+    mse, l1, ages, matches, kept = [], [], [], [], None
     for seq, motion in batches:
         seq, motion = seq.to(runner.device), motion.to(runner.device)
         target = seq[:, runner.args.input_frames:runner.args.input_frames + pred_len]
@@ -177,11 +182,17 @@ def evaluate(runner, batches, pred_len, with_velocity):
         e2, e1 = frame_errors(pred, target)
         mse.append(e2.cpu())
         l1.append(e1.cpu())
+        ages.append(boundary_age(motion, runner.args.input_frames).cpu())
         if with_velocity:
             matches.append(velocity_matches(aux["U"], motion))
-    out = {"mse": torch.cat(mse).numpy(), "l1": torch.cat(l1).numpy()}
+        if keep and kept is None:
+            kept = (seq[:keep].cpu(), motion[:keep].cpu(), pred[:keep].cpu())
+    out = {"mse": torch.cat(mse).numpy(), "l1": torch.cat(l1).numpy(),
+           "boundary_age": torch.cat(ages).numpy()}
     if matches:
         out["velocity_matches"] = torch.cat(matches).numpy()
+    if kept is not None:
+        out["kept_seq"], out["kept_motion"], out["kept_pred"] = (k.numpy() for k in kept)
     return out
 
 
@@ -204,17 +215,69 @@ def chunks(data, batch_size):
         yield seq[s:s + batch_size], motion[s:s + batch_size]
 
 
-def prediction_strip(seq, pred, input_frames, path):
-    """Ground truth over predictions for a few sequences, saved as a small PNG."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    n, T = seq.shape[0], seq.shape[1]
-    full = torch.cat([seq[:, :input_frames], pred], dim=1)
-    rows = torch.stack([seq, full], dim=1).reshape(2 * n, T, *seq.shape[-2:])
-    img = rows.clamp(0, 1).permute(0, 2, 1, 3).reshape(2 * n * seq.shape[-2], T * seq.shape[-1])
-    plt.imsave(path, img.numpy(), cmap="gray", vmin=0, vmax=1)
-    return path
+def save_figures(figs, fig_dir, prefix=""):
+    """Save matplotlib figures as PNGs (overwriting earlier ones) -> {name: wandb.Image}."""
+    import wandb
+    os.makedirs(fig_dir, exist_ok=True)
+    out = {}
+    for name, fig in figs.items():
+        path = os.path.join(fig_dir, f"{prefix}{name}.png")
+        fig.savefig(path, dpi=90)
+        plt.close(fig)
+        out[name] = wandb.Image(path)
+    return out
+
+
+def diagnostics(runner, args, probe, probe_long, pred_len, epoch, val_matches):
+    """Figures of the model's state on fixed probe sequences, for an image epoch."""
+    import wandb
+    model, device, T = runner.model, runner.device, args.input_frames
+    model.eval()
+    with torch.no_grad():
+        pred, _ = runner(probe[0][:4].to(device), probe[1][:4].to(device), pred_len)
+        long_seq, long_motion = probe_long
+        long_pred, _ = runner(long_seq.to(device), long_motion.to(device), long_seq.shape[1] - T)
+    long_pred = long_pred.cpu()
+    states = slot_states(model, probe[0][0].to(device), probe[1][0].to(device), T, pred_len,
+                         oracle=runner.oracle)
+    figs = {
+        "probe_strip": rollout_figure(probe[0][:4, :, 0].numpy(), pred.cpu()[:, :, 0].numpy(), T,
+                                      every=1, title=f"val probe, epoch {epoch}"),
+        "slot_states": state_figure(states, T, title=f"val probe 0, epoch {epoch}"),
+        "extrapolation": rollout_figure(long_seq[:, :, 0].numpy(), long_pred[:, :, 0].numpy(), T,
+                                        every=5, title=f"100-frame rollout, epoch {epoch}"),
+        "lag_bias": lag_bias_figure(model),
+    }
+    if val_matches is not None:
+        figs["velocity_per_step"] = velocity_figure(
+            summarize(torch.from_numpy(val_matches))["vel_acc_per_step"])
+    log = save_figures(figs, os.path.join(args.save_dir, "figures"))
+    long_mse = (long_pred - long_seq[:, T:]).pow(2).mean(dim=(0, 2, 3, 4)).tolist()
+    log["extrapolation_mse"] = wandb.plot.line_series(
+        xs=list(range(T + 1, long_seq.shape[1] + 1)), ys=[long_mse], keys=["4 probe sequences"],
+        title="rollout MSE on the 100-frame probe", xname="frame t")
+    return log
+
+
+def final_figures(runner, args, test, gen, pred_len):
+    """Figures of the best checkpoint on the test and 100-frame sets, and horizon curves."""
+    import wandb
+    model, device, T = runner.model, runner.device, args.input_frames
+    figs = {}
+    for name, d, every in (("test", test, 1), ("len_gen", gen, 5)):
+        seq = torch.from_numpy(d["kept_seq"][0]).to(device)
+        motion = torch.from_numpy(d["kept_motion"][0]).to(device)
+        states = slot_states(model, seq, motion, T, seq.shape[0] - T, oracle=runner.oracle)
+        figs[f"final_slot_states_{name}"] = state_figure(states, T, title=f"best model, {name} 0",
+                                                         every=every)
+    figs["final_extrapolation"] = rollout_figure(gen["kept_seq"][:, :, 0], gen["kept_pred"][:, :, 0],
+                                                 T, every=5, title="best model, 100-frame set")
+    log = save_figures(figs, os.path.join(args.save_dir, "figures"))
+    t = list(range(T + 1, T + gen["mse"].shape[1] + 1))
+    log["final_rollout_mse"] = wandb.plot.line_series(
+        xs=t, ys=[gen["mse"].mean(0).tolist(), np.median(gen["mse"], 0).tolist()],
+        keys=["mean", "median"], title="rollout MSE, 100-frame set", xname="frame t")
+    return log
 
 
 def main(argv=None):
@@ -240,8 +303,9 @@ def main(argv=None):
                  f"use another --save_dir or delete it")
 
     import wandb
-    run = wandb.init(project=args.wandb_project, name=args.wandb_name, mode=args.wandb_mode,
-                     dir=args.save_dir, id=resume["wandb_id"] if resume else None,
+    run = wandb.init(project=args.wandb_project, name=args.wandb_name, group=args.wandb_group,
+                     mode=args.wandb_mode, dir=args.save_dir,
+                     id=resume["wandb_id"] if resume else None,
                      resume="allow" if resume else None,
                      config={**vars(args), "git_commit": commit, "git_dirty": dirty,
                              "code_hash": code_hash})
@@ -260,6 +324,8 @@ def main(argv=None):
         val_ds = Subset(val_ds, range(min(args.max_val_samples, len(val_ds))))
     probe = fixed_set(make_dataset(args.root, True, args.seq_len, args.input_frames, random=False,
                                    seed=args.data_seed, **data_kw), args.val_probe_size)
+    probe_long = fixed_set(make_dataset(args.root, True, args.gen_seq_len, args.input_frames,
+                                        random=False, seed=args.data_seed + 1, **data_kw), 4)
 
     torch.manual_seed(args.model_seed)
     np.random.seed(args.model_seed)
@@ -295,7 +361,8 @@ def main(argv=None):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     history = {"epoch": [], "train_loss": [], "val_loss": [], "val_mse": [], "epoch_time_sec": [],
-               "probe_step": [], "probe_loss": [], "train_step": [], "train_curve": []}
+               "val_vel_acc": [], "val_vel_acc_boundary": [], "probe_step": [], "probe_loss": [],
+               "train_step": [], "train_curve": [], "steps_per_epoch": None}
     start_epoch, best_val, best_epoch = 1, float("inf"), None
     if resume is not None:
         model.load_state_dict(resume["model"])
@@ -353,21 +420,20 @@ def main(argv=None):
             history[k].append(v)
         log = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "val_mse": val_mse,
                "epoch_time_sec": epoch_time, "global_step": epoch * steps_per_epoch}
+        history["steps_per_epoch"] = steps_per_epoch
         vel = ""
         if "velocity_matches" in r:
             acc = summarize(torch.from_numpy(r["velocity_matches"]))
             log.update(val_vel_acc=acc["vel_acc"], val_vel_acc_boundary=acc["vel_acc_boundary"])
+            history["val_vel_acc"].append(acc["vel_acc"])
+            history["val_vel_acc_boundary"].append(acc["vel_acc_boundary"])
             vel = f" | vel {100 * acc['vel_acc']:.2f}% (boundary {100 * acc['vel_acc_boundary']:.2f}%)"
         if device.type == "cuda":
             log["max_memory_gb"] = torch.cuda.max_memory_allocated() / 1e9
             vel += f" | peak {log['max_memory_gb']:.1f} GB"
-        if args.image_every and epoch % args.image_every == 0:
-            model.eval()
-            with torch.no_grad():
-                pred, _ = runner(probe[0][:4].to(device), probe[1][:4].to(device), pred_len)
-            path = prediction_strip(probe[0][:4], pred.cpu(), args.input_frames,
-                                    os.path.join(args.save_dir, "probe_strip.png"))
-            log["probe_strip"] = wandb.Image(path)
+        if args.image_every and (epoch % args.image_every == 0 or epoch == 1):
+            log.update(diagnostics(runner, args, probe, probe_long, pred_len, epoch,
+                                   r.get("velocity_matches")))
         improved = val_loss < best_val
         if improved:
             best_val, best_epoch = val_loss, epoch
@@ -387,11 +453,12 @@ def main(argv=None):
     t0 = time.time()
     test = evaluate(runner, fixed_batches(
         make_dataset(args.root, False, args.seq_len, args.input_frames, seed=TEST_SEED,
-                     **data_kw_test), args.n_test, args.eval_batch_size), pred_len, with_velocity)
+                     **data_kw_test), args.n_test, args.eval_batch_size), pred_len, with_velocity,
+        keep=4)
     gen = evaluate(runner, fixed_batches(
         make_dataset(args.root, False, args.gen_seq_len, args.input_frames, seed=LEN_GEN_SEED,
                      **data_kw_test), args.n_len_gen, args.gen_batch_size),
-        args.gen_seq_len - args.input_frames, with_velocity)
+        args.gen_seq_len - args.input_frames, with_velocity, keep=3)
     summary = {"best_epoch": best_epoch, "best_val_loss": best_val,
                "test_mse": float(test["mse"].mean()), "test_l1": float(test["l1"].mean()),
                "test_mse_median": float(np.median(test["mse"].mean(1))),
@@ -405,13 +472,17 @@ def main(argv=None):
         acc = summarize(torch.from_numpy(test["velocity_matches"]))
         summary.update(test_vel_acc=acc["vel_acc"], test_vel_acc_boundary=acc["vel_acc_boundary"],
                        test_vel_both_boundary=acc["vel_both_boundary"])
-    np.savez_compressed(os.path.join(args.save_dir, "test_errors.npz"),
-                        test_mse=test["mse"], test_l1=test["l1"], len_gen_mse=gen["mse"],
-                        **({"test_velocity_matches": test["velocity_matches"]}
-                           if "velocity_matches" in test else {}))
+    np.savez_compressed(
+        os.path.join(args.save_dir, "test_errors.npz"),
+        test_mse=test["mse"], test_l1=test["l1"], test_boundary_age=test["boundary_age"],
+        len_gen_mse=gen["mse"], len_gen_boundary_age=gen["boundary_age"],
+        strip_seq=gen["kept_seq"], strip_pred=gen["kept_pred"],
+        **{f"{split}_velocity_matches": d["velocity_matches"]
+           for split, d in (("test", test), ("len_gen", gen)) if "velocity_matches" in d})
     with open(os.path.join(args.save_dir, "results.json"), "w") as f:
         json.dump({"summary": summary, "history": history, "args": vars(args)}, f, indent=1)
     run.summary.update(summary)
+    wandb.log(final_figures(runner, args, test, gen, pred_len))
     print(">>> " + "  ".join(f"{k} {v:.4e}" if isinstance(v, float) else f"{k} {v}"
                              for k, v in summary.items()), flush=True)
     open(os.path.join(args.save_dir, "DONE"), "w").close()

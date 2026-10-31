@@ -192,3 +192,18 @@ def test_attention_is_causal():
         _, aux = model(x, pred_len=1, context_predictions=True)
         _, aux2 = model(x2, pred_len=1, context_predictions=True)
     assert torch.equal(aux["context_pred"], aux2["context_pred"])
+
+
+@pytest.mark.parametrize("lift", [NoLift(), MotionLift(2)])
+def test_returned_slots_reproduce_the_rollout(lift):
+    """slot_h at time t, read at paths[t + 1], is the prediction of frame t + 1."""
+    x = moving_objects()
+    model = make_model(lift)
+    with torch.no_grad():
+        pred, _ = model(x, pred_len=4)
+        pred_s, aux = model(x, pred_len=4, return_slots=True)
+        h, paths = aux["slot_h"], aux["paths"]
+        assert h.shape[2] == T + 3 and paths.shape[2] == T + 4
+        reread = model.read(h[:, :, T - 1:], paths[:, :, T:])
+    assert torch.equal(pred, pred_s)
+    assert (reread - pred).abs().max() < 1e-12

@@ -156,11 +156,15 @@ class METransformer(nn.Module):
         out = self.decoder(y.reshape(-1, *y.shape[-3:]))
         return out.view(*y.shape[:-3], *out.shape[-3:])
 
-    def forward(self, context, pred_len, gt_motion=None, context_predictions=False):
+    def forward(self, context, pred_len, gt_motion=None, context_predictions=False,
+                return_slots=False):
         """context (B, T, C, H, W) -> predictions of frames T..T+pred_len-1 and an aux dict.
 
         aux: P, U from the lift; with context_predictions, also 'context_pred', the predictions
-        of frames 1..T-1 read at the lifted paths (the velocity measured on the target frame).
+        of frames 1..T-1 read at the lifted paths (the velocity measured on the target frame);
+        with return_slots, also 'slot_h', the last block's output of every slot at times
+        0..T+pred_len-2 (time t predicts frame t+1), and 'paths', the slot offsets at times
+        0..T+pred_len-1.
         """
         B, T = context.shape[:2]
         P, u, U = self.lift(context, gt_motion)
@@ -170,15 +174,23 @@ class METransformer(nn.Module):
         aux = {"P": P, "U": U}
         if context_predictions:
             aux["context_pred"] = self.read(h[:, :, :-1], P[:, :, 1:])
+        slot_h, paths = ([h], [P]) if return_slots else (None, None)
 
         y, Pt, preds = h[:, :, -1], P[:, :, -1], []
         for j in range(pred_len):
             Pt = Pt + u
             frame = self.read(y, Pt)
             preds.append(frame)
+            if return_slots:
+                paths.append(Pt[:, :, None])
             if j + 1 == pred_len:
                 break
             fed = frame.detach() if self.detach_feedback else frame
             h, caches = self.transformer(self.tokens(fed[:, None], Pt[:, :, None]), caches, T + j)
             y = h.view(B, K, *h.shape[2:])
+            if return_slots:
+                slot_h.append(y[:, :, None])
+        if return_slots:
+            aux["slot_h"] = torch.cat(slot_h, dim=2)
+            aux["paths"] = torch.cat(paths, dim=2)
         return torch.stack(preds, dim=1), aux
