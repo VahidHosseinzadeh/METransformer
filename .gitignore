@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Data, checkpoints and run outputs
+/data
+tmp/
+wandb/
+runs/
+smoke/
+experiments_*/
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.zip
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local notes, notebooks and Claude config (kept out of git, as in FEConvLSTM)
+CLAUDE.md
+LESSONS.md
+.claude/
+*.ipynb
+paper/
+/paper Resources*/
+paper_met/
