@@ -17,6 +17,7 @@ wandb/
 runs/
 smoke/
 experiments_*/
+slurm_*.log
 *.pt
 *.pth
 *.ckpt
