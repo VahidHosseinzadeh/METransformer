@@ -37,3 +37,6 @@ LESSONS.md
 paper/
 /paper Resources*/
 paper_met/
+
+# Figure PDFs (make_figures regenerates them; the PNGs and the table are tracked)
+figures/*.pdf

@@ -32,6 +32,7 @@ STYLE = {
 }
 OURS, REFS = ("met", "tf"), ("melstm", "felstm", "lstm")
 N_SHARED = 2512  # unique sequences in MELSTM's 100-frame set
+FAIL = 1e-2  # a sequence whose MSE over t=16-25 exceeds this has lost a digit
 MELSTM_TABLE = {  # MELSTM paper, Fig. 2 table: test MSE t=16-25 and t=100, s/epoch (A100)
     "lstm": ("3.26e-2 ± 0.05e-2", "2.01e-1 ± 1.34e-1", "77"),
     "felstm": ("1.54e-3 ± 0.42e-3", "8.83e-2 ± 6.58e-2", "918"),
@@ -120,7 +121,7 @@ def fig_training(runs, refs, out):
     ax.set_xlabel("epoch", fontsize=9)
     ax.set_ylabel("validation MSE + L1 (probe)", fontsize=9)
     style_axes(ax)
-    ax.legend(fontsize=7, frameon=False)
+    ax.legend(fontsize=7, frameon=False, loc="center left", bbox_to_anchor=(1.01, 0.5))
     save(fig, out, "training")
 
 
@@ -171,7 +172,6 @@ def fig_rollout(runs, refs, out):
     axes[1].axhline(1, color="0.4", lw=0.8)
     axes[1].set_title("velocity change before the boundary (dots: seeds)", fontsize=9)
     axes[2].axhline(1, color="0.4", lw=0.8)
-    axes[2].set_yscale("log")
     axes[2].set_ylabel("age-1 / settled median MSE", fontsize=9)
     axes[2].set_title("age-1 group over the rollout", fontsize=9)
     for ax in axes[[0, 2]]:
@@ -223,7 +223,7 @@ def fig_strips(runs, refs, out, seqs=(0, 1), every=5):
                      color="red" if tt >= 25 else ("black" if tt < 15 else "0.4"))
     fig.tight_layout(pad=0.3)
     fig.suptitle("100-frame rollouts, frame t (gray: trained horizon 16-25; red: beyond it)",
-                 fontsize=8, y=1.0 + 0.6 / fig.get_figheight())
+                 fontsize=8, y=1.0 + 0.25 / fig.get_figheight())
     save(fig, out, "strips")
 
 
@@ -233,14 +233,19 @@ AXES = (("rate", "A", "realised switching rate", "motion_rate"),
 
 
 def load_motion(runs, refs_root):
-    """{model: [ {regime: (x values dict, median MSE t=16-25)} per seed ]} for ours and MELSTM's."""
+    """{model: [ {regime: (npz, median MSE t=16-25, share above FAIL)} per seed ]} for ours and
+    MELSTM's."""
+    def cell(z):
+        err = z["per_seq_err"][:, :10].mean(1)
+        return z, float(np.median(err)), float((err > FAIL).mean())
+
     out = {}
     for model, entries in runs.items():
         for r in entries:
             cells = {}
             for f in glob.glob(os.path.join(r["dir"], "motion_factors", "*.npz")):
                 d = np.load(f)
-                cells[str(d["regime"])] = (d, float(np.median(d["per_seq_err"][:, :10].mean(1))))
+                cells[str(d["regime"])] = cell(d)
             if cells:
                 out.setdefault(model, []).append(cells)
     for d in sorted(glob.glob(os.path.join(refs_root or "", "ms*", "motion_factors"))):
@@ -248,15 +253,17 @@ def load_motion(runs, refs_root):
             cells = {}
             for f in glob.glob(os.path.join(d, f"motion_factors_{model}_*.npz")):
                 z = np.load(f, allow_pickle=True)
-                cells[str(z["regime"])] = (z, float(np.median(z["per_seq_err"][:, :10].mean(1))))
+                cells[str(z["regime"])] = cell(z)
             if cells:
                 out.setdefault(model, []).append(cells)
     return out
 
 
 def fig_motion(motion, out):
-    """MELSTM's motion-generalization sensitivity: median MSE over t=16-25 on each regime,
-    divided by the model's own median at the centre (1 = the new motion costs nothing)."""
+    """MELSTM's motion-generalization sensitivity (top): median MSE over t=16-25 on each regime,
+    divided by the model's own median at the centre (1 = the new motion costs nothing). A median
+    does not see the sequences a model loses, so the bottom row gives their share: MSE above
+    FAIL, on a log scale (a seed with none drops out)."""
     if not motion:
         return
     ours = next((c for m in OURS for c in motion.get(m, [])), None)
@@ -265,8 +272,8 @@ def fig_motion(motion, out):
         a, b = float(ours["centre"][0]["motion_rate"]), float(ref["centre"][0]["motion_rate"])
         print(f"centre realised rate: ours {a:.5f}, MELSTM's {b:.5f}"
               + ("  (same sequences)" if abs(a - b) < 1e-9 else "  WARNING: different sequences"))
-    fig, axes = plt.subplots(1, 3, figsize=(12, 3.4), sharey=True)
-    for ax, (axis, code, xlabel, key) in zip(axes, AXES):
+    fig, axes = plt.subplots(2, 3, figsize=(12, 6.4), sharey="row")
+    for col, (axis, code, xlabel, key) in enumerate(AXES):
         for model in (*OURS, *REFS):
             seeds = motion.get(model, [])
             if not seeds:
@@ -274,41 +281,77 @@ def fig_motion(motion, out):
             s = STYLE[model]
             names = sorted({n for c in seeds for n in c if n.startswith(code + ":")} | {"centre"},
                            key=lambda n: float(seeds[0][n][0][key]) if n in seeds[0] else 0.0)
-            xs, ys = [], []
+            xs, ratios, shares = [], [], []
             for n in names:
-                vals = [c[n][1] / c["centre"][1] for c in seeds if n in c and "centre" in c]
-                if not vals:
+                cells = [c for c in seeds if n in c and "centre" in c]
+                if not cells:
                     continue
                 x = float(seeds[0][n][0][key])
+                ratio = [c[n][1] / c["centre"][1] for c in cells]
+                share = [100 * c[n][2] for c in cells]
                 xs.append(x)
-                ys.append(np.median(vals))
-                ax.scatter([x] * len(vals), vals, s=6, color=s["color"], alpha=0.5, zorder=3)
-            ax.plot(xs, ys, color=s["color"], ls=s["ls"], lw=1.6, marker="o", ms=3, label=s["label"])
-        ax.axhline(1, color="0.4", lw=0.8)
-        ax.set_yscale("log")
-        ax.set_xlabel(xlabel, fontsize=9)
-        ax.set_title(f"axis {code}", fontsize=9)
-        style_axes(ax)
-    axes[0].set_ylabel("median MSE t=16-25 / own centre", fontsize=9)
-    axes[0].legend(fontsize=7, frameon=False)
+                ratios.append(np.median(ratio))
+                shares.append(np.median(share))
+                axes[0, col].scatter([x] * len(ratio), ratio, s=6, color=s["color"], alpha=0.5, zorder=3)
+                axes[1, col].scatter([x] * len(share), share, s=6, color=s["color"], alpha=0.5, zorder=3)
+            for ax, ys in ((axes[0, col], ratios), (axes[1, col], shares)):
+                ax.plot(xs, ys, color=s["color"], ls=s["ls"], lw=1.6, marker="o", ms=3, label=s["label"])
+        axes[0, col].axhline(1, color="0.4", lw=0.8)
+        axes[0, col].set_title(f"axis {code}", fontsize=9)
+        axes[1, col].set_xlabel(xlabel, fontsize=9)
+        for ax in axes[:, col]:
+            ax.set_yscale("log", nonpositive="mask")
+            style_axes(ax)
+    axes[0, 0].set_ylabel("median MSE t=16-25 / own centre", fontsize=9)
+    axes[1, 0].set_ylabel(f"sequences with MSE > {FAIL:g} (%)", fontsize=9)
+    axes[0, 0].legend(fontsize=7, frameon=False)
     fig.tight_layout()
     save(fig, out, "motion_generalization")
 
 
-def fig_velocity(runs, out):
-    """MET's boundary velocity accuracy on the validation sequences against epochs."""
-    entries = [r for r in runs.get("met", []) if r["history"].get("val_vel_acc_boundary")]
-    if not entries:
-        return
-    fig, ax = plt.subplots(figsize=(4.2, 2.8))
-    for r in entries:
-        acc = 100 * np.array(r["history"]["val_vel_acc_boundary"])
-        ax.plot(np.arange(1, len(acc) + 1), acc, color=STYLE["met"]["color"], lw=1, alpha=0.7)
-        ax.text(len(acc) + 0.5, acc[-1], f"seed {r['seed']}", fontsize=6, va="center")
-    ax.set_xlabel("epoch", fontsize=9)
-    ax.set_ylabel("boundary velocity accuracy (%)", fontsize=9)
+def shared_errors(e):
+    """Per-sequence MSE over t=16-25 on the first 2,512 sequences of the 100-frame set, the
+    sequences every model (MELSTM's references included) was scored on."""
+    return e["len_gen_mse"][:N_SHARED, :10].mean(axis=1)
+
+
+def fig_errors(runs, refs, out):
+    """Where the mean comes from: the distribution of per-sequence errors on the shared
+    sequences, and the parameter-free tracker's failures per context step (the same for every
+    MET seed, since no weights enter the velocities)."""
+    fig, axes = plt.subplots(1, 2, figsize=(9.6, 3.4), gridspec_kw=dict(width_ratios=(1.4, 1)))
+    ax = axes[0]
+    for model in (*OURS, *REFS):
+        entries = runs.get(model) or refs.get(model) or []
+        s = STYLE[model]
+        for i, e in enumerate(sorted(entries, key=lambda r: r["seed"])):
+            x = np.sort(shared_errors(e))
+            ax.plot(x, 1 - np.arange(len(x)) / len(x), color=s["color"], ls=s["ls"], lw=1,
+                    alpha=0.8, label=f"{s['label']} ({len(entries)} seeds)" if i == 0 else None)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("per-sequence MSE, t=16-25", fontsize=9)
+    ax.set_ylabel("fraction of sequences with larger MSE", fontsize=9)
+    ax.set_title("error distribution on the shared 2,512 sequences (lines: seeds)", fontsize=9)
+    ax.legend(fontsize=7, frameon=False, loc="lower left")
     style_axes(ax)
-    save(fig, out, "velocity_accuracy")
+
+    ax = axes[1]
+    met = sorted(runs.get("met", []), key=lambda r: r["seed"])
+    if met and "test_velocity_matches" in met[0]:
+        wrong = 100 * (~met[0]["test_velocity_matches"]).mean(axis=(0, 2))
+        steps = np.arange(1, len(wrong) + 1)
+        ax.plot(steps, wrong, color=STYLE["met"]["color"], lw=1.6, marker="o", ms=3)
+        hand_over = met[0]["args"]["pair_steps"]
+        ax.axvline(hand_over - 0.5, color="0.4", lw=0.8, ls=":")
+        ax.text(hand_over - 0.3, 0.5 * wrong.max(), "co-moving template\ntakes over", fontsize=7)
+        ax.set_xticks(steps)
+    ax.set_xlabel("context step t (frame t-1 → t)", fontsize=9)
+    ax.set_ylabel("digits with a wrong velocity (%)", fontsize=9)
+    ax.set_title("MET tracker failures, 10k test sequences", fontsize=9)
+    style_axes(ax)
+    fig.tight_layout()
+    save(fig, out, "errors")
 
 
 def fmt(values):
@@ -320,33 +363,42 @@ def fmt(values):
 
 def table(runs, refs, out):
     """Test MSE (t = 16-25), rollout MSE at t = 25 and t = 100, velocity accuracy, cost."""
-    lines = ["| model | seeds | test MSE t=16-25 (10k) | median | t=100 (first 2,512) | boundary vel. acc. | s/epoch |",
-             "|---|---|---|---|---|---|---|"]
+    lines = ["| model | seeds | test MSE t=16-25 (10k) | median | shared: t=16-25 | shared: t=100 "
+             "| shared: MSE > 1e-2 | boundary vel. acc. | s/epoch |",
+             "|---|---|---|---|---|---|---|---|---|"]
     for model in OURS:
         e = runs.get(model, [])
         if not e:
             continue
         test = [r["test_mse"].mean() for r in e]
         med = [np.median(r["test_mse"].mean(1)) for r in e]
+        shared = [shared_errors(r) for r in e]
         t100 = [r["len_gen_mse"][:N_SHARED, -1].mean() for r in e]
         vel = [r["summary"].get("test_vel_acc_boundary") for r in e]
         vel = fmt_pct(vel) if all(v is not None for v in vel) else "-"
         sec = [np.median(r["history"]["epoch_time_sec"]) for r in e]
-        lines.append(f"| {STYLE[model]['label']} | {len(e)} | {fmt(test)} | {fmt(med)} | {fmt(t100)} | "
-                     f"{vel} | {np.mean(sec):.0f} |")
+        lines.append(f"| {STYLE[model]['label']} | {len(e)} | {fmt(test)} | {fmt(med)} | "
+                     f"{fmt([x.mean() for x in shared])} | {fmt(t100)} | "
+                     f"{fmt_pct([(x > FAIL).mean() for x in shared])} | {vel} | {np.mean(sec):.0f} |")
     for model in REFS:
         e = refs.get(model, [])
         if not e:
             continue
+        shared = [shared_errors(r) for r in e]
         t100 = [r["len_gen_mse"][:, -1].mean() for r in e]
         rep = MELSTM_TABLE[model]
         lines.append(f"| {STYLE[model]['label']} (MELSTM paper) | {len(e)} | {rep[0]} | - | "
-                     f"{fmt(t100)} (paper: {rep[1]}) | - | {rep[2]} (A100) |")
+                     f"{fmt([x.mean() for x in shared])} | {fmt(t100)} (paper: {rep[1]}) | "
+                     f"{fmt_pct([(x > FAIL).mean() for x in shared])} | - | {rep[2]} (A100) |")
     text = "\n".join(lines)
-    note = ("\nMeans ± s.d. over seeds. Test: first 10,000 test sequences (seed 123). t=100: the "
-            "first 2,512 sequences of the 100-frame set (seed 42), the unique sequences of "
-            "MELSTM's evaluation; MELSTM's paper numbers are over its 10,000 rows (4 copies of "
-            "those). s/epoch: training pass only, on this repository's GPU for MET/Transformer.\n")
+    note = ("\nMeans ± s.d. over seeds. Test: first 10,000 test sequences (seed 123); MELSTM's "
+            "column is its paper's, over 4 copies of the first 2,512 of them. Shared: the first "
+            "2,512 sequences of the 100-frame set (seed 42), the unique sequences of MELSTM's "
+            "evaluation, scored by every model: mean MSE over t=16-25, MSE at t=100 (paper: over "
+            "MELSTM's 10,000 rows, 4 copies of those), and the share of sequences whose t=16-25 "
+            "MSE exceeds 1e-2. MET's velocities come from a parameter-free tracker, so its "
+            "velocity accuracy is the same for every seed. s/epoch: training pass only, V100 for "
+            "MET/Transformer, A100 for MELSTM's runs.\n")
     with open(os.path.join(out, "table.md"), "w") as f:
         f.write(text + "\n" + note)
     print(text + "\n" + note)
@@ -362,6 +414,8 @@ def main():
     p.add_argument("--runs", default="runs")
     p.add_argument("--reference", default=None, help="MELSTM's cluster_runs/pure_h")
     p.add_argument("--out", default="figures")
+    p.add_argument("--wandb", action="store_true",
+                   help="also log the figures and the table to one W&B run, next to the training runs")
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
     runs = load_runs(args.runs)
@@ -371,9 +425,24 @@ def main():
     fig_training(runs, refs, args.out)
     fig_rollout(runs, refs, args.out)
     fig_strips(runs, refs, args.out)
-    fig_velocity(runs, args.out)
+    fig_errors(runs, refs, args.out)
     fig_motion(load_motion(runs, args.reference), args.out)
     table(runs, refs, args.out)
+    if args.wandb:
+        log_wandb(args.out)
+
+
+def log_wandb(out, project="METransformer"):
+    """The figures and the table as the run 'comparison' (group 'summary'); a rerun updates it."""
+    import wandb
+    run = wandb.init(project=project, id="comparison-mm", name="comparison", group="summary",
+                     job_type="analysis", resume="allow")
+    run.log({f"figures/{os.path.splitext(os.path.basename(f))[0]}": wandb.Image(f)
+             for f in sorted(glob.glob(os.path.join(out, "*.png")))})
+    rows = [[c.strip() for c in line.strip().strip("|").split("|")]
+            for line in open(os.path.join(out, "table.md")) if line.startswith("| ")]
+    run.log({"table": wandb.Table(columns=rows[0], data=rows[1:])})
+    run.finish()
 
 
 if __name__ == "__main__":
