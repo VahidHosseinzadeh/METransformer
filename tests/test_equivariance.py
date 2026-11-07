@@ -79,6 +79,65 @@ def test_motion_equivariant_transformer(velocity, attn):
     assert (pred_m - expected).abs().max() < 1e-10
 
 
+@pytest.mark.parametrize("state_template", ["dec", "nmean", "mean"])
+@pytest.mark.parametrize("pair_steps", [2, 4])
+def test_state_tracking_is_motion_equivariant(state_template, pair_steps):
+    """Slot-state velocities obey the gauge law and the predictions transform with the motion.
+    The norm's affine is randomised: at initialisation the 'nmean' template is zero."""
+    x = moving_objects()
+    psi = random_motion(x.shape[0], T, seed=2)
+    model = make_model(MotionLift(2, "state", pair_steps=pair_steps, state_template=state_template))
+    with torch.no_grad():
+        model.norm.weight.normal_()
+        model.norm.bias.normal_()
+        pred, aux = model(x, pred_len=5)
+        pred_m, aux_m = model(act(psi, x), pred_len=5)
+    dpsi = psi[:, 1:] - psi[:, :-1]
+    assert equal_on_torus(aux_m["U"][:, :, 1:], aux["U"][:, :, 1:] + dpsi[:, None])
+    assert (pred_m - act(continued(psi, 5), pred)).abs().max() < 1e-10
+
+
+def test_state_lift_without_state_steps_is_the_pair_lift():
+    """With every step before pair_steps, the frame-by-frame context pass reproduces the
+    parallel pass of the 'pair' lift: same velocities, same slot outputs and predictions."""
+    x = moving_objects()
+    with torch.no_grad():
+        p1, a1 = make_model(MotionLift(2, "state", pair_steps=T + 1))(x, 4, return_slots=True)
+        p2, a2 = make_model(MotionLift(2, "pair"))(x, 4, return_slots=True)
+    assert torch.equal(a1["U"], a2["U"])
+    assert (a1["slot_h"] - a2["slot_h"]).abs().max() < 1e-10
+    assert (p1 - p2).abs().max() < 1e-10
+
+
+def test_state_velocity_correlates_the_previous_slot_output():
+    """U_t of every slot is the phase correlation of its output at t-1, placed at P_{t-1},
+    against X_t."""
+    x = moving_objects()
+    model = make_model(MotionLift(2, "state", pair_steps=2))
+    with torch.no_grad():
+        _, aux = model(x, pred_len=2, return_slots=True)
+        h, P, U = aux["slot_h"], aux["paths"], aux["U"]
+        for t in range(2, T):
+            u = model.lift.step(x, U, t, P[:, :, t - 1], model.state_template(h[:, :, t - 1]))
+            assert torch.equal(u, U[:, :, t])
+
+
+def test_state_tracking_backward():
+    """Training through the frame-by-frame context: every parameter gets a gradient, and
+    checkpointing the blocks does not change it."""
+    x = moving_objects()
+    model = make_model(MotionLift(2, "state", pair_steps=2)).train()
+    grads = []
+    for checkpoint in (False, True):
+        model.checkpoint = checkpoint
+        model.zero_grad()
+        pred, _ = model(x[:, :5], pred_len=2)
+        (pred - x[:, 5:7]).pow(2).mean().backward()
+        grads.append([p.grad.clone() for p in model.parameters()])
+    assert all(g.abs().sum() > 0 for g in grads[0])
+    assert all((a - b).abs().max() < 1e-12 for a, b in zip(*grads))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_motion_equivariance_on_cuda_float32():
     """In float32 proper. With TF32 convolutions and matmuls (the CUDA default on Ampere,
@@ -120,7 +179,8 @@ def test_plain_transformer_is_not_motion_equivariant():
     assert (pred_m - act(continued(psi, 3), pred)).abs().max() > 1e-3
 
 
-@pytest.mark.parametrize("lift", [NoLift(), FlowLift(1), MotionLift(2)])
+@pytest.mark.parametrize("lift", [NoLift(), FlowLift(1), MotionLift(2),
+                                  MotionLift(2, "state", pair_steps=2)])
 def test_cached_rollout_matches_parallel_pass(lift):
     """The rollout (KV cache, one frame per step) equals one causal pass over the context
     followed by the fed-back predictions."""

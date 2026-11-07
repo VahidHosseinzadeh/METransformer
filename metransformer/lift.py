@@ -68,19 +68,34 @@ class MotionLift(nn.Module):
       'pair'    MELSTM's frame-pair velocities: the K strongest peaks of PC(X_{t-1}, X_t),
                 assigned to the slots by closeness to their previous velocities.
       'oracle'  the dataset's true velocities (a diagnostic; needs gt_motion and K digits).
+      'state'   slot-state tracking, MELSTM's h-tracking: from t = pair_steps on (at least 2),
+                the template of slot k is its own transformer output at t-1, rendered by
+                state_template, so the paths depend on the network and METransformer.forward
+                drives this lift one frame at a time through step(). t = 1 is the bootstrap and
+                the steps between use frame pairs, as for 'track'.
+    state_template ('state' only), how a slot output becomes a one-channel template:
+      'dec'     the decoder applied to the slot alone (after the read-out norm), as it would
+                render the slot's content without the others
+      'nmean'   the channel mean after the read-out norm (identically zero at initialisation,
+                when the norm's affine is the identity)
+      'mean'    the raw channel mean, as MELSTM tracks with h
     """
 
-    def __init__(self, n_slots=2, velocity="track", template="min", decay=1.0, pair_steps=4):
+    def __init__(self, n_slots=2, velocity="track", template="min", decay=1.0, pair_steps=4,
+                 state_template="dec"):
         super().__init__()
-        if velocity not in ("track", "pair", "oracle"):
+        if velocity not in ("track", "pair", "oracle", "state"):
             raise ValueError(f"unknown velocity model {velocity!r}")
         if template not in ("mean", "min"):
             raise ValueError(f"unknown template {template!r}")
+        if state_template not in ("dec", "nmean", "mean"):
+            raise ValueError(f"unknown state template {state_template!r}")
         self.n_slots = n_slots
         self.velocity = velocity
         self.template = template
         self.decay = decay
         self.pair_steps = pair_steps
+        self.state_template = state_template
         self.pc_boot = PhaseCorrelation(n_modes=n_slots)
         self.pc_track = PhaseCorrelation(n_modes=1)
         self.register_buffer("perms", torch.tensor(list(itertools.permutations(range(n_slots)))),
@@ -88,6 +103,9 @@ class MotionLift(nn.Module):
 
     def forward(self, x, gt_motion=None):
         B, T = x.shape[:2]
+        if self.velocity == "state":
+            raise RuntimeError("velocity 'state' needs the slot outputs: METransformer.forward "
+                               "drives it through step()")
         if self.velocity == "oracle":
             U = self._oracle(gt_motion, B, T, x.device)
         elif T < 2:
@@ -115,6 +133,25 @@ class MotionLift(nn.Module):
         for t in range(2, T):
             U[:, :, t] = self._pair_step(x, U, t)
         return U
+
+    def state_steps_from(self):
+        """The first step whose velocity comes from the slot templates ('state')."""
+        return max(2, self.pair_steps)
+
+    def step(self, x, U, t, P, tmpl=None):
+        """'state': the velocities of step t >= 1 -> (B, K, 2). The bootstrap at t = 1; frame
+        pairs before state_steps_from(); then each slot's template tmpl (B, K, C, H, W, in the
+        slot frames, from its output at t-1) placed at P = P_{t-1} and phase-correlated against
+        X_t. U (B, K, T, 2) holds the velocities of the steps before t."""
+        if t == 1:
+            return self.pc_boot(x[:, 0], x[:, 1])[0]
+        if t < self.state_steps_from():
+            return self._pair_step(x, U, t)
+        B, K = tmpl.shape[:2]
+        H, W = x.shape[-2:]
+        placed = torus_shift(tmpl.mean(dim=2, keepdim=True), P).reshape(B * K, 1, H, W)
+        frame = x[:, t].mean(dim=1, keepdim=True)[:, None].expand(B, K, 1, H, W)
+        return self.pc_track(placed, frame.reshape(B * K, 1, H, W))[0].view(B, K, 2)
 
     def _pair_step(self, x, U, t):
         """The K peaks of PC(X_{t-1}, X_t), each slot given the one closest to its U_{t-1}."""
@@ -163,11 +200,11 @@ def comoving_template(x, P, kind="mean"):
 
 
 def make_lift(name, n_slots=2, v_range=2, velocity="track", template="min", decay=1.0,
-              pair_steps=4):
+              pair_steps=4, state_template="dec"):
     if name == "none":
         return NoLift()
     if name == "flow":
         return FlowLift(v_range)
     if name == "motion":
-        return MotionLift(n_slots, velocity, template, decay, pair_steps)
+        return MotionLift(n_slots, velocity, template, decay, pair_steps, state_template)
     raise ValueError(f"unknown lift {name!r}")

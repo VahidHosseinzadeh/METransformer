@@ -55,11 +55,15 @@ def parse_args(argv=None):
     m.add_argument("--lift", choices=["none", "flow", "motion"], default="motion")
     m.add_argument("--n_slots", type=int, default=2, help="--lift motion")
     m.add_argument("--flow_v_range", type=int, default=2, help="--lift flow: |v| <= this")
-    m.add_argument("--velocity", choices=["track", "pair", "oracle"], default="track")
+    m.add_argument("--velocity", choices=["track", "pair", "oracle", "state"], default="track",
+                   help="state: each slot tracks with its own transformer output (h-tracking)")
     m.add_argument("--template", choices=["min", "mean"], default="min")
     m.add_argument("--decay", type=float, default=1.0, help="--template mean: EMA decay")
     m.add_argument("--pair_steps", type=int, default=4,
-                   help="--velocity track: steps t < this use frame-pair velocities")
+                   help="--velocity track/state: steps t < this use frame-pair velocities")
+    m.add_argument("--state_template", choices=["dec", "nmean", "mean"], default="dec",
+                   help="--velocity state: the slot output decoded alone, its channel mean after "
+                        "the read-out norm, or its raw channel mean")
     m.add_argument("--dim", type=int, default=32)
     m.add_argument("--depth", type=int, default=2)
     m.add_argument("--heads", type=int, default=4)
@@ -131,7 +135,7 @@ def code_version():
 
 def build_model(args):
     lift = make_lift(args.lift, args.n_slots, args.flow_v_range, args.velocity, args.template,
-                     args.decay, args.pair_steps)
+                     args.decay, args.pair_steps, getattr(args, "state_template", "dec"))
     return METransformer(lift, in_channels=1, dim=args.dim, depth=args.depth, heads=args.heads,
                          mlp_hidden=args.mlp_hidden, kernel=args.kernel, attn=args.attn,
                          max_dist=args.max_dist, window=args.window,

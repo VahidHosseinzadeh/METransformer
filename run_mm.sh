@@ -8,12 +8,14 @@
 #   tf          the plain transformer: the same network without a lift (one slot, no transport)
 #   met_oracle  the dataset's true velocities: the ceiling of the lift (diagnostic)
 #   met_pair    MELSTM's frame-pair velocities, continuity-assigned
+#   met_state   slot-state tracking (MELSTM's pure h-tracking): the bootstrap at t = 1, then
+#               each slot correlates its own output at t-1, decoded alone, against frame t
 #
 # SMOKE=1 trains 300 steps of one epoch and scores small test sets (wandb offline).
 # DATA_ROOT is the torchvision MNIST root (default ./data); NUM_WORKERS the data workers
 # (default 4); EXTRA_ARGS is appended.
 set -e
-ARM=${1:?usage: bash run_mm.sh met|tf|met_oracle|met_pair [model_seed]}
+ARM=${1:?usage: bash run_mm.sh met|tf|met_oracle|met_pair|met_state [model_seed]}
 MODEL_SEED=${2:-1}
 
 case $ARM in
@@ -21,7 +23,8 @@ case $ARM in
   tf)         MODEL=(--lift none) ;;
   met_oracle) MODEL=(--lift motion --velocity oracle) ;;
   met_pair)   MODEL=(--lift motion --velocity pair) ;;
-  *) echo "unknown arm: $ARM (met|tf|met_oracle|met_pair)"; exit 1 ;;
+  met_state)  MODEL=(--lift motion --velocity state --pair_steps 2 --state_template dec) ;;
+  *) echo "unknown arm: $ARM (met|tf|met_oracle|met_pair|met_state)"; exit 1 ;;
 esac
 
 SAVE_DIR=runs/${ARM}_ms${MODEL_SEED}

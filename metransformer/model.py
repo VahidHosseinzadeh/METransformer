@@ -8,7 +8,9 @@ point at earlier times: in image coordinates, the query of frame t at x reads th
 values of frame s at x - (P_t - P_s), i.e. transported by T_{t,s} (MELSTM, Sec. 6). To predict
 frame t+1, each slot's output is moved to P^k_{t+1}, the slots are max-pooled and a
 convolutional decoder renders the frame. Past the context the paths continue at the last
-velocity, and the predictions are fed back as the next tokens.
+velocity, and the predictions are fed back as the next tokens. With the lift's 'state'
+velocity, each slot tracks with its own output (MELSTM's h-tracking), so the context too runs
+one frame at a time.
 
 With every operation translation-equivariant, and the slot tokens of psi X equal to those of X
 up to the global offset psi_0 (lift.py), the predictions transform with the motion psi
@@ -145,6 +147,43 @@ class METransformer(nn.Module):
             new.append(cache)
         return tokens, new
 
+    def state_template(self, y):
+        """Slot outputs y (B, K, D, H, W) -> one-channel templates (B, K, 1, H, W) in the slot
+        frames, as the lift's state_template says ('state' velocity)."""
+        kind = self.lift.state_template
+        if kind == "dec":
+            B, K = y.shape[:2]
+            out = self.decoder(self.norm(y).reshape(B * K, *y.shape[2:]))
+            return out.view(B, K, *out.shape[1:]).mean(dim=2, keepdim=True)
+        if kind == "nmean":
+            return self.norm(y).mean(dim=2, keepdim=True)
+        return y.mean(dim=2, keepdim=True)
+
+    def _state_context(self, x):
+        """The context pass with slot-state tracking: the velocity of slot k at step t comes
+        from its own output at t-1 (its prediction of frame t), so the paths depend on the
+        transformer and the context runs one frame at a time with the key/value cache. The
+        velocities are argmaxes, constants for the gradient, like every lift's.
+        -> h (B, K, T, D, H, W), P (B, K, T, 2), U (B, K, T, 2), caches."""
+        lift = self.lift
+        B, T = x.shape[:2]
+        K = lift.n_slots
+        U = torch.zeros(B, K, T, 2, dtype=torch.long, device=x.device)
+        P = torch.zeros(B, K, 2, dtype=torch.long, device=x.device)
+        hs, paths, caches, y = [], [], None, None
+        for t in range(T):
+            if t >= 1:
+                with torch.no_grad():
+                    tmpl = (self.state_template(y.detach())
+                            if t >= lift.state_steps_from() else None)
+                    U[:, :, t] = lift.step(x, U, t, P, tmpl)
+            P = P + U[:, :, t]
+            paths.append(P)
+            h, caches = self.transformer(self.tokens(x[:, t:t + 1], P[:, :, None]), caches, t)
+            y = h.view(B, K, *h.shape[2:])
+            hs.append(y)
+        return torch.stack(hs, dim=2), torch.stack(paths, dim=2), U, caches
+
     def read(self, y, P):
         """Slot outputs y (B, K, ..., D, H, W) in the slot frames, placed at P (B, K, ..., 2)
         -> frames (B, ..., C, H, W)."""
@@ -167,10 +206,14 @@ class METransformer(nn.Module):
         0..T+pred_len-1.
         """
         B, T = context.shape[:2]
-        P, u, U = self.lift(context, gt_motion)
+        if getattr(self.lift, "velocity", None) == "state":
+            h, P, U, caches = self._state_context(context)
+            u = U[:, :, -1]
+        else:
+            P, u, U = self.lift(context, gt_motion)
+            h, caches = self.transformer(self.tokens(context, P))
+            h = h.view(B, P.shape[1], T, *h.shape[2:])
         K = P.shape[1]
-        h, caches = self.transformer(self.tokens(context, P))
-        h = h.view(B, K, T, *h.shape[2:])
         aux = {"P": P, "U": U}
         if context_predictions:
             aux["context_pred"] = self.read(h[:, :, :-1], P[:, :, 1:])
